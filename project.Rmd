@@ -1,0 +1,992 @@
+---
+title: "Online Retail Dataset"
+author: "Fintan Cannon"
+date: "3/9/2022"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: cerulean
+    highlight: kate
+    self_contained: false
+---
+
+
+  ```{r Import required libraries,echo = FALSE,warning = FALSE,message = FALSE}
+library(readr)
+library(tidyverse)
+library(treemapify)
+library(viridis)
+library(stringr)
+library(rfm)
+library(magrittr)
+library(snakecase)
+library(cowplot)
+library(scales)
+library(arules)
+library(arulesViz)
+library(gridExtra)
+
+```
+
+# 1. Introduction
+
+This workbook explores a dataset pertaining to the transactions of a non-store online retailer based in the United Kingdom. 
+This workbook will firsty perform basic data exploration of the dataset and implement add value models focusing on CRM management and consumer purchasing patterns.  
+  
+* Variable Summary:   
+  + InvoiceNo: Invoice number. Nominal, a 6-digit integral number uniquely assigned to each transaction. If this code starts with letter 'c', it indicates a cancellation.
+  + StockCode: Product (item) code. Nominal, a 5-digit integral number uniquely assigned to each distinct product.
+  + Description: Product (item) name. Nominal.
+  + Quantity: The quantities of each product (item) per transaction. Numeric.
+  + InvoiceDate: Invice Date and time. Numeric, the day and time when each transaction was generated.
+  + UnitPrice: Unit price. Numeric, Product price per unit in sterling.
+  + CustomerID: Customer number. Nominal, a 5-digit integral number uniquely assigned to each customer.
+  + Country: Country name. Nominal, the name of the country where each customer resides.
+
+## 1.2 Goals for this project
+
+Analyze data initially to derive insights that typically add value in an online retail context. 
+Features such as stock code, unit price, customer id etc will allow us answer such question as
+which SKUs and customers drive revenue the most and when are the busiest times of the year for the retailer. 
+
+The features present will allow us segment customers by performing a Recency, Frequency and Monetary(RFM)
+based on their past purchasing behavior. Based on the customer's segmentation the most optimal 
+add value action can be executed in relation to each respective customer. 
+
+Finally, a market basket analysis will be performed to identify which SKUs are frequently
+purchased together.Knowledge of this will allow for revenue to be maximised by upselling. 
+
+
+## 1.3 Load data and view variable summaries.
+
+
+```{r}
+retail <- read.csv('C:\\Users\\Finta\\Downloads\\OnlineRetail.csv\\OnlineRetail.csv')
+summary(retail)
+```
+
+
+# 2. Preprocessing 
+
+Add additional variables to the data set and standardise the variable names.
+The additional variables will allow us analyse the data better and will prove useful when building our respective models. 
+
+```{r}
+retail <- retail %>% set_colnames(names(.) %>% to_snake_case())
+
+
+retail <- retail %>% mutate(
+  total_spend = unit_price * quantity, 
+  customer_id = as.character(customer_id),
+  invoice_hour = as.numeric(format(strptime(invoice_date, "%m/%d/%Y %H:%M"),format = "%H")),
+  invoice_date = as.Date(invoice_date, format = '%m/%d/%Y'),
+  invoice_month = as.factor(format(invoice_date,"%m")),
+  invoice_day = as.factor(format(invoice_date,"%A")), 
+  invoice_week = as.factor(format(invoice_date,"%V")),
+  refund = str_detect(retail$invoice_no,"^C"),
+)
+
+
+```
+
+* New Variable Notes:
+  + refund - Denotes whether observation was canceled transaction and money refunded. Refunds can be identified by having the letter C as the first letter of an observation's invoice number value. 
+  + total_spend - Total revenue for each respective transaction. 
+
+
+## 2.1 Remove obvious errors
+
+Some obvious errors exist such as an extremely large order quantity input which was canceled. 
+Some empty transactions exist which have a unit price of zero and customer id value. The value these observations bring is minimal so are removed. 
+
+```{r}
+
+#Remove obvious transaction errors
+transaction_errors <- retail %>% filter(total_spend < -5000 | total_spend > 5000) %>%
+  pull(total_spend)
+`%notin%` <- Negate(`%in%`)
+retail <- retail %>% filter(total_spend %notin% transaction_errors)
+
+# Remove 'empty' transactions: Total spend equals 0.00
+retail <- retail %>% filter(total_spend != 0.00)
+
+```
+
+## 2.2 Non-transactional records
+
+Using stock code and description variables we can see the rows that contain non-transactional information such as samples. 
+
+```{r}
+# Non-transactional stock code & description values
+
+lapply(1:9, function(x){
+  j <- retail[which(nchar(retail$stock_code) == x),]
+  head(table(j$description))
+}) 
+
+```
+
+Counting the most common stock codes according to the number of characters in it.
+Stock codes with values of D,M,S represent discounts, manual imput and samples respectively. 
+
+Stock code characters = 1: Discount, Manual input or Sample.  
+Stock code characters = 2: 'carriage' primarily pertaining to transactions to Ireland.  
+Stock code characters = 3: Dotcom Postage.  
+Stock code characters = 4: Postage.  
+Stock code characters = 7: Unsaleable, destroyed.  
+Stock code characters = 9: Amazon Fee  
+
+```{r}
+# Amazon fee
+amazon_fee <- retail[which(retail$stock_code == 'AMAZONFEE'),]
+amazon_fee_total <- amazon_fee %>% 
+  summarise(total_amazon_fee = round(sum(total_spend))) %>%
+  pull(total_amazon_fee) %>%
+  comma()
+# Total Amazon Fee cost
+```
+Outgoing expense labeled 'AMAZONFEE' totals £`r amazon_fee_total`
+
+```{r}
+# Postage
+postage_fee <- retail[which(retail$stock_code == 'POST'),]
+postage_fee_total <- postage_fee %>%
+  summarise(total_postage_fee = round(sum(total_spend))) %>%
+  pull(total_postage_fee) %>%
+  comma()
+```
+Revenue labeled 'POST' recorded in primarily non UK transactions totals £`r postage_fee_total`.
+
+```{r}
+#Remove chosen values
+retail <- retail %>% filter(stock_code %notin% c('S','M'))
+retail <- retail[-which(retail$stock_code == 'AMAZONFEE'),]
+retail <- retail[-which(retail$stock_code == 'POST'),]
+```
+Removing transactions pertaining to stock code values for samples, manual input, amazon fees and postage. 
+
+## 2.3 Refunds
+
+
+```{r,warning = FALSE,message = FALSE}
+
+refund_per_transaction <- round(mean(retail$refund == 'TRUE'),3)
+refund_per_transaction
+```
+Total number of refunds per item bought is `r refund_per_transaction`
+
+```{r,warning = FALSE,message = FALSE}
+
+refund_invoice <-retail %>% filter(refund == 'TRUE') %>% 
+  group_by(invoice_no,customer_id) %>%
+  summarise(refund_total = sum(total_spend)) %>%
+  mutate(refund_total = abs(refund_total)) # Data frame containing refunded invoices only. 
+
+sale_invoice <- retail %>% filter(refund == 'FALSE') %>% 
+  group_by(invoice_no,customer_id) %>%
+  summarise(refund_total = sum(total_spend)) # Data frame containing sales invoices only. 
+
+
+# Match refunds with sales based off total invoice amount and customer id
+sale_refund_df <- sale_invoice %>% inner_join(refund_invoice,by = c('customer_id','refund_total'))
+sale_refund_invoices <- c(sale_refund_df$invoice_no.x,sale_refund_df$invoice_no.y) 
+# Combining sales & refund invoice numbers in one vector
+
+retail %>% filter(invoice_no == '537217' | invoice_no == 'C537406') %>% select(-c(invoice_date,invoice_hour,invoice_month, invoice_day,invoice_week))
+
+
+
+retail <- retail %>% filter(invoice_no %notin% sale_refund_invoices) 
+# Removing invoice numbers pertaining to initial transaction and refund. 
+
+
+```
+
+Some canceled sales invoices can be matched up with their sales equivalent by matching the customer id and if the absolute value of each invoice is identical. 
+
+## 2.4 Missing values
+
+```{r}
+#Missing Values
+lapply(retail, function(x){
+  missing <- is.na(x)
+  length(which(missing == 'TRUE'))
+}) #Function counting the number of missing values in each variable
+```
+customer_id is the only variable with missing values
+
+```{r}
+#customer_id missing values
+mean(is.na(retail$customer_id))  
+```
+Proportion of missing values in customer_id variable. 
+
+
+```{r,warning = FALSE,message = FALSE}
+# Total spend comparing existing and missing customer ids
+m1 <- retail %>% mutate(missing_cust_id = is.na(customer_id)) %>%
+  ggplot(aes(total_spend, fill = missing_cust_id)) +
+  geom_histogram() +
+  scale_y_continuous(trans = "log10",labels = comma) +
+  scale_x_continuous(trans = "log2",labels = comma) +
+  xlab("Total Spend") +
+  ylab("Count") +
+  ggtitle("Total Spend by missing and existing customer id") +
+  guides(fill=guide_legend('Missing Customer Id')) 
+
+
+# Daily transactions comparing exisiting and missing customer ids
+m2 <-retail %>% mutate(missing_cust_id = is.na(customer_id)) %>%
+  ggplot(aes(invoice_day, fill = missing_cust_id,label = )) +
+  geom_histogram(stat = "count") +
+  xlab("Day") +
+  ylab("Transaction Count") +
+  ggtitle("Transactions by day of the week") +
+  guides(fill=guide_legend('Missing Customer Id'))
+
+# Country transactions comparing existing and missing customer ids
+m3 <-retail %>% mutate(missing_cust_id = is.na(customer_id)) %>%
+  ggplot(aes(country, fill = missing_cust_id)) +
+  geom_histogram(stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  guides(fill=guide_legend('Missing Customer Id'))
+
+# Month transactions comparing existing and missing customer ids
+m4 <- retail %>% mutate(missing_cust_id = is.na(customer_id)) %>%
+  ggplot(aes(invoice_month, fill = missing_cust_id)) +
+  geom_histogram(stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab("Month") +
+  ylab("Transaction Count") +
+  ggtitle("Transactions by month") +
+  guides(fill=guide_legend('Missing Customer Id'))
+
+# Epoch transactions comparing existing and missing customer ids
+m5 <- retail %>% mutate(missing_cust_id = is.na(customer_id)) %>%
+  ggplot(aes(invoice_week, fill = missing_cust_id)) +
+  geom_histogram(stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  guides(fill=guide_legend('Missing Customer Id'))
+
+grid.arrange(m1,m2,m4)
+```
+
+No discernible reason as to why missing customer id values exist. 
+
+
+# 3. Exploring Variables 
+
+
+## 3.1 Invoice_Number
+Each individual invoice number represents the purchase(s) made by a customer on a given occasion.
+
+```{r}
+unique_invoices <- comma(length(unique(retail$invoice_no)))
+# Number of transactions
+```
+A total of `r unique_invoices` unique invoices contained in this data set
+
+
+
+```{r}
+# Total spend per invoice
+invoice_spend <- retail %>% group_by(invoice_no) %>%
+  summarise(total_invoice_amount = sum(total_spend)) %>% 
+  arrange(desc(total_invoice_amount))
+summary(invoice_spend$total_invoice_amount)
+
+```
+Difference between median and mean caused by a number of high revenue generating invoices. 
+
+```{r,warning = FALSE,message = FALSE}
+# Total spend per invoice histogram
+invoice_hist <- invoice_spend %>%
+  ggplot(aes(total_invoice_amount)) +
+  geom_histogram(bins = 10) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  geom_vline(xintercept = mean(invoice_spend$total_invoice_amount),        # Add line for mean
+             col = "green",
+             lwd = 3) +
+  geom_vline(xintercept = median(invoice_spend$total_invoice_amount),        # Add line for median
+             col = "red",
+             lwd = 3) +
+  xlab("Total Invoice Amount") +
+  ylab("Count") +
+  ggtitle("Invoice Amount Histogram")
+
+invoice_hist_log <- invoice_spend %>%
+  ggplot(aes(total_invoice_amount)) +
+  geom_histogram(bins = 10) +
+  scale_x_continuous(trans = 'log2', labels = comma) +
+  scale_y_continuous(trans = "log2",labels = comma) +
+  geom_vline(xintercept = mean(invoice_spend$total_invoice_amount),       
+             col = "green",
+             lwd = 3) +                                                     # Add line for mean
+  geom_vline(xintercept = median(invoice_spend$total_invoice_amount),        
+             col = "red",
+             lwd = 3) +                                                     # Add line for median
+  xlab("Total Invoice Amount") +
+  ylab("Count") +
+  ggtitle("Invoice Amount Histogram - Log 2") 
+
+grid.arrange(invoice_hist,invoice_hist_log)
+
+
+  
+```
+: Plot 1: Right skewed distribution of the total invoice amounts; a relatively small number of invoices have much larger total amounts than the median invoice amount. 
+Plot 2: Scaled distribution of total invoice amount using log2. 
+
+Green Line = Mean: `r round(mean(invoice_spend$total_invoice_amount))`  
+Red Line = Median: `r median(invoice_spend$total_invoice_amount)`  
+
+```{r}
+invoice_item_quantities <- retail %>% group_by(invoice_no) %>%
+ summarise(quantities_bought = sum(quantity)) %>%
+  arrange(desc(quantities_bought))
+summary(invoice_item_quantities$quantities_bought)
+
+invoice_item_quantities %>% ggplot(aes('',quantities_bought)) +
+  geom_boxplot() +
+  xlab("") +
+  ylab("Quanties per Invoice") +
+  ggtitle("Quantity of Items per Invoice") 
+```
+: Summarized distribution of quantity of items bought per invoice. 
+
+
+```{r,warning = FALSE,message = FALSE}
+# number of items bought per transactions
+
+invoice_quantities <- invoice_item_quantities %>%
+  ggplot(aes(quantities_bought)) +
+  geom_histogram() +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  geom_vline(xintercept = mean(invoice_item_quantities$quantities_bought),        # Add line for mean
+             col = "green",
+             lwd = 3) +
+  geom_vline(xintercept = median(invoice_item_quantities$quantities_bought),        # Add line for median
+             col = "red",
+             lwd = 3) +
+  xlab("Quantities Bought Per Invoice") +
+  ylab("Count") +
+  ggtitle("Quantities Per Invoice Histogram") 
+
+invoice_quantities_log <- invoice_item_quantities %>%
+  ggplot(aes(quantities_bought)) +
+  geom_histogram() +
+  scale_x_continuous(trans = 'log2',labels = comma) +
+  scale_y_continuous(trans = "log2",labels = comma) +
+  geom_vline(xintercept = mean(invoice_item_quantities$quantities_bought),        # Add line for mean
+             col = "green",
+             lwd = 3) +
+  geom_vline(xintercept = median(invoice_item_quantities$quantities_bought),        # Add line for median
+             col = "red",
+             lwd = 3) +
+  xlab("Quantities Bought Per Invoice") +
+  ylab("Count") +
+  ggtitle("Quantities Per Invoice Histogram - Log2") 
+
+grid.arrange(invoice_quantities,invoice_quantities_log)
+
+```
+
+
+## 3.2 Stock Code
+```{r}
+## stock_code
+sku_num <- comma(length(unique(retail$stock_code))) #Number of SKUS
+
+```
+Number of unique SKUs is `r sku_num`
+
+```{r}
+
+# SKU sales count
+sku_sales_count <- retail %>% filter(nchar(retail$stock_code) == 6 |nchar(retail$stock_code) == 7 | nchar(retail$stock_code) == 5) %>%
+  count(stock_code)
+summary(sku_sales_count$n)
+
+```
+Summary of individual SKU sales count  
+
+*Note: Sales count in this context denotes how often an indivual stock code was included in an invoice. 
+
+```{r}
+#SKU sales distribution
+sku_sales_count  %>%
+  arrange(desc(n)) %>%
+  ggplot(aes(x = reorder(stock_code,n),n)) +
+  geom_bar(stat = 'identity',position="dodge") +
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) +
+  coord_flip() +
+  xlab("Stock Code") +
+  ylab("SKU Invoice Inclusion") +
+  ggtitle("SKU Invoice Inclusion Count") +
+  scale_y_continuous(labels = comma)# Conforms strongly to the power rule 
+```
+
+SKU purchase distribution conforms strongly to the power rule; a small number of SKUs account for a large percentage of overall SKUs sold. 
+
+
+```{r}
+# SKU sales distribution by quantile - Mosaic graph
+sku_sales_count  %>%
+  mutate(stock_quant = ntile(rank(n),10)) %>%
+  group_by(stock_quant) %>%
+  summarise(total_quantile_count = sum(n)) %>%
+  mutate(items_sold_proportion = round(total_quantile_count/sum(total_quantile_count),2)) %>%
+  ggplot(aes(area = total_quantile_count, fill = stock_quant, label = paste0('Q',stock_quant,'\n\n',items_sold_proportion)))+
+  geom_treemap() +
+  geom_treemap_text(colour = "Black",
+                    place = "centre",
+                    size = 20,
+                    show.legend = TRUE) +
+  theme(legend.position = "none") +
+  scale_fill_viridis(option="mako") +
+  ggtitle("Quantile Sales Count Proportion")
+```
+: Each SKU is allocated a quantile based on its respective sales count with the top selling SKUs assigned to Q10.  
+
+The top 10% selling SKUs account for 45% of total SKUs sold.   
+The top 20% selling SKUs account for 65% of total SKUs sold.  
+
+```{r,warning = FALSE,message = FALSE}
+# Most popular skus
+popular_stock_code <- sku_sales_count %>% slice_max(n,n = 20)
+popular_stock_code <- popular_stock_code %>% left_join(retail) %>% group_by(stock_code,description,n) %>%
+    summarise(total_spend = sum(total_spend)) %>%
+  filter(total_spend > 0) %>%
+  arrange(desc(n)) %>% 
+  rename('total_transaction_number' = n)
+popular_stock_code[1:2,]
+
+
+```
+
+Some stock codes have more than one corresponding description as can be seen above with the highest selling SKU. 
+
+
+
+```{r}
+popular_stock_code %>%
+  arrange(total_transaction_number) %>%
+  ggplot(aes(total_transaction_number,fct_inorder(description))) +
+  geom_bar(stat = 'identity') +
+  xlab("Count of SKUs included in an invoice") +
+  ylab("SKU Description") +
+  ggtitle("Most Popular SKUs") +
+  scale_x_continuous(labels = comma)
+```
+: Some stock codes have more than one corresponding description as can be seen above with the highest selling SKU. 
+
+
+
+```{r,warning = FALSE,message = FALSE}
+# Most profitable skus
+profitable_stock_code <- popular_stock_code %>% left_join(retail) %>% group_by(stock_code,description,total_transaction_number) %>%
+    summarise(total_spend = sum(total_spend)) %>%
+  filter(total_spend > 0) %>%
+  arrange(desc(total_spend))
+profitable_stock_code
+```
+Highest revenue generating SKUs
+
+```{r}
+
+profitable_stock_code %>%
+  arrange(total_spend) %>%
+  ggplot(aes(total_spend,fct_inorder(description))) +
+  geom_bar(stat = 'identity') +
+  xlab("Total Revenue") +
+  ylab("SKU Description") +
+  ggtitle("Most Profitable SKUs") +
+  scale_x_continuous(labels = comma)
+
+```
+
+```{r,warning = FALSE,message = FALSE}
+# Non performing SKUs
+non_performing_skus <- sku_sales_count %>% filter(n < 4) %>%
+  left_join(retail) %>%
+  filter(total_spend < 50) %>%
+  group_by(stock_code,description) %>%
+  summarise(stock_code_revenue = sum(total_spend),number_of_basket_entries = n())
+non_performing_skus_nrow <- non_performing_skus %>% nrow()
+```
+`r non_performing_skus_nrow` SKUs have a total revenue of under £50.
+
+```{r,warning = FALSE,message = FALSE}
+
+# frequently returned stock items 
+retail %>% filter(nchar(retail$stock_code) == 6 |nchar(retail$stock_code) == 7) %>%
+  filter(refund == 'TRUE') %>%
+  count(stock_code) %>%
+  arrange(desc(n)) %>%
+  top_n(6)
+
+```
+
+
+
+## 3.3 Quantity
+
+
+```{r}
+summary(retail$quantity)
+
+```
+
+
+```{r}
+#Distribution of SKU quantities purchased in a transaction
+retail %>% 
+  filter(quantity > 0) %>%
+  ggplot(aes(quantity)) +
+  geom_histogram(binwidth = 0.5) +
+  scale_x_continuous(trans = 'log2',labels = comma) +
+  geom_vline(xintercept = mean(retail$quantity),        # Add line for mean
+             col = "green",
+             lwd = 3) +
+    geom_vline(xintercept = median(retail$quantity),        # Add line for median
+             col = "red",
+             lwd = 3) +
+  xlab("Quantities of SKUs bought") +
+  ylab("Count") +
+  ggtitle("SKU Quantities Bought") +
+  scale_y_continuous(labels = comma)
+```
+: Green Line = Mean: `r round(mean(retail$quantity))`  
+Red Line = Median: `r median(retail$quantity)`  
+
+```{r,warning = FALSE,message = FALSE}
+quantities_sold_per_invoice <- retail %>% group_by(invoice_no) %>%
+  summarise(total_quantities_sold = sum(quantity))
+quantities_sold_per_invoice %>% ggplot(aes(total_quantities_sold)) +
+  geom_histogram(binwidth = 0.5) +
+  scale_x_continuous(trans = 'log2',labels = comma) +
+  xlab("Quantity Per Invoice") +
+  ylab("Count") +
+  ggtitle("Quantity Count Per Invoice") +
+  scale_y_continuous(labels = comma)
+```
+
+## 3.4 Customer ID
+
+```{r}
+
+mean(is.na(retail$customer_id))
+
+```
+Total proportion of missing ids is `r mean(is.na(retail$customer_id))`
+
+
+```{r}
+length(unique(retail$customer_id))
+```
+
+Total number of unique customer ids is `r length(unique(retail$customer_id))`
+
+
+```{r,warning = FALSE,message = FALSE}
+customer_spend <- retail %>% 
+  filter(!is.na(customer_id)) %>%
+  group_by(customer_id) %>%
+  summarise(total_customer_spend = sum(total_spend)) %>%
+  arrange(desc(total_customer_spend)) %>%
+  mutate(proportion_of_total_spend = total_customer_spend/sum(total_customer_spend))
+
+customer_spend %>% top_n(10)
+```
+Highest revenue customers and their proportion of overall revenue. 
+```{r}
+# Customer spend by quantile
+customer_spend %>%
+  mutate(quantile = ntile(rank(total_customer_spend),10)) %>%
+  group_by(quantile) %>%
+  summarise(total_spend = sum(total_customer_spend)) %>%
+  mutate(percent_of_sales = total_spend/sum(total_spend),percent_of_sales = scales::percent(percent_of_sales),total_spend = total_spend/1000000) %>%
+  ggplot(aes(area = total_spend,fill = quantile,label = paste(percent_of_sales, round(total_spend,digits = 2),paste('Q',quantile), sep = "\n"))) +
+  geom_treemap() +
+  geom_treemap_text(colour = "Black",
+                    place = "centre",
+                    size = 20,
+                    show.legend = TRUE) +
+  theme(legend.position = "none") +
+  scale_fill_viridis(option="mako")
+```
+: Line 1: Percentage of Revenue.  
+Line 2: Revenue in millions.  
+Line 3: Quantile.  
+
+The top 20% of customers account for around 73% of total revenue. 
+
+## 3.5 Country
+
+```{r}
+length(unique(retail$country))
+```
+Number of countries sold to.
+
+```{r,warning = FALSE,message = FALSE}
+customer_country <- retail %>% select(customer_id,country) %>%
+  group_by(customer_id) %>%
+  summarise(country = unique(country))
+table(customer_country$country)
+```
+Number of customers per country
+
+```{r,warning = FALSE,message = FALSE}
+retail %>% group_by(country) %>%
+  summarise(spend_per_country = round(sum(total_spend))) %>%
+  mutate(prop = round(spend_per_country/sum(spend_per_country),2)) %>% 
+  ggplot(aes(area = spend_per_country, fill = country, label = paste(country,comma(spend_per_country),prop,sep = "\n"))) +
+  geom_treemap() +
+  geom_treemap_text(colour = "Black",
+                    place = "centre",
+                    size = 20,
+                    show.legend = TRUE) +
+  theme(legend.position = "none")
+```
+: Line 1: Country.  
+Line 2: Total Revenue.  
+Line 3: Proportion of Revenue.  
+
+```{r,warning = FALSE,message = FALSE}
+# Non UK Country Spend
+retail %>% filter(country != 'United Kingdom') %>%
+  group_by(country) %>%
+  summarise(spend_per_country = round(sum(total_spend))) %>%
+  arrange(spend_per_country) %>%
+  ggplot(aes(fct_inorder(country),spend_per_country)) +
+  geom_bar(stat = 'identity') +
+  scale_y_continuous(trans = 'log2') +
+  coord_flip() +
+  ylab("Revenue Per Country") +
+  xlab("Country") +
+  ggtitle("Total Revenue Per Non-UK Country") +
+  scale_y_continuous(labels = comma)
+```
+
+
+```{r,warning = FALSE,message = FALSE}
+# Customers per country
+retail %>% group_by(country) %>%
+  summarise(no_of_customers = length(unique(customer_id))) %>%
+  arrange(no_of_customers) %>%
+  ggplot(aes(fct_inorder(country),no_of_customers)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  ylab("Customers Per Country") +
+  xlab("Country") +
+  ggtitle("Total Customers Per Country") +
+  scale_y_continuous(labels = comma)
+```
+
+
+```{r,warning = FALSE,message = FALSE}
+# Customers per country minus UK
+retail %>% filter(country != 'United Kingdom') %>%
+  group_by(country) %>%
+  summarise(no_of_customers = length(unique(customer_id))) %>%
+  arrange(no_of_customers) %>%
+  ggplot(aes(fct_inorder(country),no_of_customers)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  ylab("Customers Per Country") +
+  xlab("Country") +
+  ggtitle("Total Customers Per Non-UK Country") +
+  scale_y_continuous(labels = comma)
+```
+
+
+```{r,warning = FALSE,message = FALSE}
+# Invoices per country
+retail %>% group_by(country) %>%
+  summarise(invoices_per_country = length(unique(invoice_no))) %>%
+  arrange(invoices_per_country) %>%
+  ggplot(aes(fct_inorder(country),invoices_per_country)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  ylab("Invoices Per Country") +
+  xlab("Country") +
+  ggtitle("Total Invoices Per Country") +
+  scale_y_continuous(labels = comma)
+```
+
+
+```{r,warning = FALSE,message = FALSE}
+# Invoices per country minus UK
+retail %>% filter(country != 'United Kingdom') %>%
+  group_by(country) %>%
+  summarise(invoices_per_country = length(unique(invoice_no))) %>%
+  arrange(invoices_per_country) %>%
+  ggplot(aes(fct_inorder(country),invoices_per_country)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  ylab("Invoices Per Country") +
+  xlab("Country") +
+  ggtitle("Total Invoices Per Non-UK Country") +
+  scale_y_continuous(labels = comma)
+```
+
+## 4. Time Series
+
+```{r,warning = FALSE,message = FALSE}
+range(retail$invoice_date)
+```
+Incomplete calender year for 2011 so dates should range from Dec 2010 to Nov 2011
+
+```{r,warning = FALSE,message = FALSE}
+calender_year_sales <- retail %>% filter(between(invoice_date,as.Date('2010-12-01'),as.Date('2011-11-30')))
+range(calender_year_sales$invoice_date)
+```
+Remove dates non pertinent to the above range. 
+
+```{r,warning = FALSE,message = FALSE}
+epoch_summary <- calender_year_sales %>% 
+  group_by(invoice_week) %>%
+  summarise(total_weekly_earnings = sum(total_spend),
+            weekly_transactions_no = length(unique(invoice_no)))
+epoch_summary_ordered <- epoch_summary[c(48:51,1:47),]
+
+epoch_summary_scaled <- epoch_summary_ordered %>%
+  mutate(total_weekly_earnings = scale(total_weekly_earnings),
+         weekly_transactions_no = scale(weekly_transactions_no))
+head(epoch_summary_ordered)
+head(epoch_summary_scaled)
+
+```
+Data frames detailing both scaled and total weekly revenue and number of transactions(invoices recorded)
+
+
+```{r,warning = FALSE,message = FALSE}
+epoch_summary_scaled %>%
+  gather(factor,value,-invoice_week) %>%
+  mutate(factor = as.factor(factor)) %>%
+  mutate(factor = recode_factor(factor,total_weekly_earnings = 'Weekly Revenue',weekly_transactions_no = 'Weekly Transactions')) %>%
+  ggplot(aes(fct_inorder(invoice_week),value,group= factor,color = factor)) +
+  geom_line() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  guides(color =guide_legend('')) +
+  ylab("Z Score") +
+  xlab("Invoice Week") +
+  ggtitle("Transaction and Revenue Weekly Distribution") +
+  scale_y_continuous(labels = comma)
+```
+: Weekly revenue heavily correlated with the number of transactions.  
+Week 37 to 41 sees a divergence from this correlation. Possible that some wholesalers place large revenue generating orders during this window. 
+
+
+```{r,warning = FALSE,message = FALSE}
+epoch_summary_earnings <- epoch_summary_ordered %>% 
+  select(invoice_week,total_weekly_earnings) %>%
+  gather(total_weekly_earnings,value,-invoice_week) %>%
+  ggplot(aes(fct_inorder(invoice_week),value,group = total_weekly_earnings)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ylab("Revenue") +
+  xlab("Invoice Week") +
+  ggtitle("Total Weekly Revenue") +
+  scale_y_continuous(labels = comma)
+epoch_summary_earnings
+```
+: Invoice revenue per week. 
+
+```{r,warning = FALSE,message = FALSE}
+# Total sales by month
+monthly_earnings <- calender_year_sales %>% group_by(invoice_month) %>%
+  summarise(earnings_by_month = sum(total_spend))
+monthly_earnings <- monthly_earnings[c(12,1:11),]
+monthly_earnings %>%
+  ggplot(aes(fct_inorder(invoice_month),earnings_by_month,group = 1)) +
+  geom_line() +
+  ylab("Revenue") +
+  xlab("Invoice Month") +
+  ggtitle("Total Montly Revenue") +
+  scale_y_continuous(labels = comma)
+  
+```
+
+# 5. RFM Analysis
+
+```{r,warning = FALSE,message = FALSE}
+arb_date <- max(retail$invoice_date) + 1
+
+rfm_retail <- retail %>% filter(!is.na(customer_id)) %>%
+  group_by(invoice_no,customer_id,invoice_date) %>%
+  summarise(total_spend = sum(total_spend))
+```
+
+Prepare data frame for RFM analysis by removing rows with missing customer id values.
+
+```{r,warning = FALSE,message = FALSE}
+#RFM Table
+rfm_data  <- rfm_table_order(
+  data = rfm_retail,
+  customer_id = customer_id,
+  order_date = invoice_date,
+  revenue = total_spend,
+  analysis_date = arb_date,
+  recency_bins = 5,
+  frequency_bins = 5,
+  monetary_bins = 5,
+)
+rfm_data[1:6,]
+```
+Assign RFM score to each customer id. 
+```{r,warning = FALSE,message = FALSE}
+# Assign segments names
+segment_names <- c("Champions", "Loyal Customers", "Potential Loyalist",
+                   "New Customers", "Promising", "Need Attention", "About To Sleep",
+                   "At Risk", "Can't Lose Them", "Hibernating", "Lost")
+
+# Assign classification rules for segments
+recency_lower   <- c(4, 2, 3, 4, 3, 3, 2, 1, 1, 2, 1)
+recency_upper   <- c(5, 4, 5, 5, 4, 4, 3, 2, 1, 3, 1)
+frequency_lower <- c(4, 3, 1, 1, 1, 3, 1, 2, 4, 2, 1)
+frequency_upper <- c(5, 4, 3, 1, 1, 4, 2, 5, 5, 3, 1)
+monetary_lower  <- c(4, 4, 1, 1, 1, 3, 1, 2, 4, 2, 1)
+monetary_upper  <- c(5, 5, 3, 1, 1, 4, 2, 5, 5, 3, 1)
+
+segments <- rfm_segment(rfm_data, segment_names, recency_lower, recency_upper,
+                        frequency_lower, frequency_upper, monetary_lower, monetary_upper)
+```
+
+```{r,warning = FALSE,message = FALSE}
+# Combine customer segmentation with main data frame
+combined_rfm_df <- retail %>% left_join(segments) %>% 
+  select(customer_id,total_spend,segment,rfm_score,recency_score,frequency_score,monetary_score,stock_code)
+combined_rfm_df <- combined_rfm_df %>% group_by(customer_id) %>%
+  summarise(total_spend = sum(total_spend),segment = unique(segment),rfm_score = unique(rfm_score),
+            recency_score = unique(recency_score),frequency_score = unique(frequency_score), monetary_score = unique(monetary_score))
+combined_rfm_df
+```
+
+```{r,warning = FALSE,message = FALSE}
+# Count of customers per section
+combined_rfm_df %>% filter(!is.na(customer_id)) %>%
+  group_by(segment) %>%
+  summarise(count = n(), spend = round(sum(total_spend)))
+```
+
+```{r,warning = FALSE,message = FALSE}
+segment_count <- combined_rfm_df %>% filter(!is.na(customer_id)) %>%
+  group_by(segment) %>%
+  summarise(count = n(), spend = sum(total_spend)) %>%
+    arrange(count) %>%
+  ggplot(aes(count,fct_inorder(segment))) +
+  geom_bar(stat = 'identity') +
+  ylab("Segment") +
+  xlab("Count") +
+  ggtitle("Total Segment Count") +
+  scale_x_continuous(labels = comma)
+
+segment_spend <- combined_rfm_df %>% filter(!is.na(customer_id)) %>%
+  group_by(segment) %>%
+  summarise(count = n(), spend = sum(total_spend)) %>%
+    arrange(spend) %>%
+  ggplot(aes(spend,fct_inorder(segment))) +
+  geom_bar(stat = 'identity') +
+  ylab("Segment") +
+  xlab("Revenue") +
+  ggtitle("Total Segment Revenue") +
+  scale_x_continuous(labels = comma)
+  
+grid.arrange(segment_count,segment_spend) 
+  
+```
+
+# 6. Market Basket Analysis
+
+## 6.1 Feature: Description
+
+Model to identify what products are likely to be purchased together and be used to develop or optimize  cross selling initiatives on retail sites. 
+
+```{r,warning = FALSE,message = FALSE}
+# Preprocess data for basket analysis - Description
+retail_basket <- retail %>% filter(refund == 'FALSE') %>%
+  select(invoice_no,description)
+retail_basket <- retail_basket %>% group_by(invoice_no) %>%
+  mutate(id = cur_group_id()) %>% 
+  ungroup() %>%
+  select(id, description) # Assign basket variable as a key. 
+```
+
+```{r,warning = FALSE,message = FALSE}
+# Convert data to class transaction
+retail_list <- split(retail$description,retail_basket$id) # Group items according the basket they belong to
+retail_trans <- as(retail_list,'transactions') #Convert list to transactions
+retail_rules <- apriori(retail_trans, parameter=list(supp=0.007, conf=0.4)) # Create rule object
+
+
+# Visualise rules
+plot(retail_rules)
+```
+: Support: The percentage of transactions that contain all of the items in an itemset.   
+Confidence: The probability that a transaction that contains the items on the left hand side of the rule also contains the item on the right hand side.  
+Lift: The increase in likelihood of the right hand side item of the rule being purchased given the left hand side item(s) of the rule are purchased.   
+```{r,warning = FALSE,message = FALSE}
+# Inspect rules
+inspect(head(sort(retail_rules,by='lift'),35))
+```
+
+```{r,warning = FALSE,message = FALSE}
+retail_hi_lift <- head(sort(retail_rules, by = 'lift'),50)
+plot(retail_hi_lift,method = 'graph',col = 'blue',cex = 1)
+```
+
+```{r,warning = FALSE,message = FALSE}
+itemFrequencyPlot(retail_trans,topN=30,type = 'absolut',horiz = TRUE)
+```
+: Most frequently purchased items.    
+## 6.2 Feature: Stock Code
+
+Model is applied in the same way except the variable now used in stock code. 
+```{r,warning = FALSE,message = FALSE}
+# Preprocess data for basket analysis - Stock Code
+retail_basket_stock <- retail %>% filter(refund == 'FALSE') %>%
+  select(invoice_no,stock_code)
+retail_basket_stock <- retail_basket_stock %>% group_by(invoice_no) %>%
+  mutate(id = cur_group_id()) %>% 
+  ungroup() %>%
+  select(id, stock_code) # Assign basket variable as a key. 
+summary(retail_basket_stock)
+```
+
+```{r,warning = FALSE,message = FALSE}
+# Convert data to class transaction
+retail_list_stock <- split(retail$stock_code,retail_basket_stock$id) # Group items according the basket they belong to
+retail_trans_stock <- as(retail_list_stock,'transactions') #Convert list to transactions
+retail_rules_stock <- apriori(retail_trans_stock, parameter=list(supp=0.007, conf=0.4)) # Create rule object
+
+```
+
+```{r,warning = FALSE,message = FALSE}
+# Visualise rules
+plot(retail_rules_stock)
+```
+
+```{r,warning = FALSE,message = FALSE}
+# Inspect rules
+inspect(head(sort(retail_rules_stock,by='lift'),35))
+```
+
+```{r,warning = FALSE,message = FALSE}
+retail_hi_lift_stock <- head(sort(retail_rules_stock, by = 'lift'),50)
+plot(retail_hi_lift_stock,method = 'graph',col = 'blue',cex = 1)
+```
+
+```{r,warning = FALSE,message = FALSE}
+itemFrequencyPlot(retail_trans_stock,topN=30,type = 'absolut',horiz = TRUE)
+```
+
+
+
+
